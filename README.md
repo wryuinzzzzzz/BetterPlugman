@@ -40,7 +40,7 @@ The project is managed using modern Gradle (Kotlin DSL).
 ```bash
    git clone [https://github.com/yourusername/BetterPlugman.git](https://github.com/yourusername/BetterPlugman.git)
    cd BetterPlugman
-
+```
 
 ## TODO
 https://github.com/wryuinzzzzzz/BetterPlugman/issues/1
