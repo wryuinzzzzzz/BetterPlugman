@@ -1,0 +1,6 @@
+name: BetterPlugman
+version: '${version}'
+
+main: net.ilypluggy.betterplugman.Main
+api-version: '1.21.4'
+load: POSTWORLD
