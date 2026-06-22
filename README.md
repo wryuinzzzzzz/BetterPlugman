@@ -1,7 +1,7 @@
 <h1 align="center">BetterPlugman</h1>
 
 <p align="center">
-  <img src="logo.png" alt="BetterPlugman Logo" width="500"/>
+  <img src="logo.png" alt="BetterPlugman Logo" width="650"/>
 </p>
 
 <p align="center">
