@@ -1,32 +1,49 @@
 package net.ilypluggy.betterplugman.cmd
 
+import net.ilypluggy.betterplugman.cfg.PluginConfig
+import net.ilypluggy.betterplugman.dag.DagResult
+import net.ilypluggy.betterplugman.dag.DependencyGraph
+import net.ilypluggy.betterplugman.dag.PluginYmlParser
+import net.ilypluggy.betterplugman.loader.JarVersionSpoofer
+import net.ilypluggy.betterplugman.loader.PluginPurger
 import org.bukkit.Bukkit
 import org.bukkit.plugin.Plugin
 import org.bukkit.plugin.java.JavaPlugin
 import java.io.File
-import java.net.URLClassLoader
-import java.util.logging.Level
 
-class PluginRegistry(private val plugin: JavaPlugin) {
+class PluginRegistry(
+    private val plugin: JavaPlugin,
+    private val config: PluginConfig,
+) {
+    private val pluginManager get() = Bukkit.getPluginManager()
+    private val purger = PluginPurger(plugin, config)
+    private val ymlParser = PluginYmlParser(plugin.logger)
+    private val versionSpoofer = JarVersionSpoofer(plugin.logger)
+    
+    /**
+     * Tracks plugin names that were unloaded in the current session.
+     * When version-spoofing-on-reload is enabled, these plugins will have
+     * their version rewritten before being reloaded to bypass Paper's
+     * duplicate identifier check.
+     */
+    private val unloadedInSession = mutableSetOf<String>()
 
-    private val pluginManager = Bukkit.getPluginManager()
+    private val pluginsDirectory: File get() = plugin.dataFolder.parentFile
+    private val scratchDirectory: File get() = File(plugin.dataFolder, ".reload-scratch")
 
     fun loadPlugin(fileName: String): Result<Plugin> = runCatching {
-        val pluginDirectory = plugin.dataFolder.parentFile
         val formattedName = if (fileName.endsWith(".jar")) fileName else "$fileName.jar"
-        val pluginFile = File(pluginDirectory, formattedName)
+        val pluginFile = File(pluginsDirectory, formattedName)
 
         if (!pluginFile.exists()) {
             throw IllegalArgumentException("File ${pluginFile.name} was not found in plugins folder")
         }
 
-        val targetPlugin = pluginManager.loadPlugin(pluginFile)
-            ?: throw IllegalStateException("Error with plugin structure")
-
-        targetPlugin.onLoad()
-        pluginManager.enablePlugin(targetPlugin)
-        Bukkit.getOnlinePlayers().forEach { it.updateCommands() }
-        targetPlugin
+        if (config.autoResolveDependencies) {
+            loadWithDependencies(pluginFile).getOrThrow()
+        } else {
+            loadSingleJar(pluginFile).getOrThrow()
+        }
     }
 
     fun unloadPlugin(targetPlugin: Plugin): Result<Unit> = runCatching {
@@ -38,48 +55,106 @@ class PluginRegistry(private val plugin: JavaPlugin) {
             pluginManager.disablePlugin(targetPlugin)
         }
 
-        runCatching {
-            val paperPluginManagerClass = Class.forName("io.papermc.paper.plugin.entrypoint.LaunchEntryPointHandler")
-            val handlerField = paperPluginManagerClass.getDeclaredField("INSTANCE").apply { isAccessible = true }
-            val handler = handlerField.get(null)
+        purger.purge(targetPlugin)
+        
+        // Track this plugin as unloaded in the current session
+        unloadedInSession.add(targetPlugin.name)
 
-            val storageField = handler.javaClass.getDeclaredField("storage").apply { isAccessible = true }
-            val storage = storageField.get(handler)
-
-            val pluginsMapField = storage.javaClass.getDeclaredField("plugins").apply { isAccessible = true }
-            val pluginsMap = pluginsMapField.get(storage) as? MutableMap<*, *>
-            pluginsMap?.remove(targetPlugin.name.lowercase())
-        }.onFailure {
-            plugin.logger.log(Level.WARNING, "Failed to remove plugin from Paper storage fallback to Bukkit", it)
-        }
-
-        runCatching {
-            val bukkitPm = pluginManager
-            val pluginsField = bukkitPm.javaClass.getDeclaredField("plugins").apply { isAccessible = true }
-            val lookupNamesField = bukkitPm.javaClass.getDeclaredField("lookupNames").apply { isAccessible = true }
-            val plugins = pluginsField.get(bukkitPm) as? MutableList<*>
-            val lookupNames = lookupNamesField.get(bukkitPm) as? MutableMap<*, *>
-            plugins?.remove(targetPlugin)
-            lookupNames?.remove(targetPlugin.name.lowercase())
-        }
-
-        val classLoader = targetPlugin.javaClass.classLoader
-        if (classLoader is URLClassLoader) {
-            runCatching {
-                classLoader.close()
-            }.onFailure {
-                plugin.logger.log(Level.SEVERE, "Could not close ClassLoader for ${targetPlugin.name}", it)
-            }
-        }
-
-        System.gc()
         Bukkit.getOnlinePlayers().forEach { it.updateCommands() }
     }
+
     fun reloadPlugin(targetPlugin: Plugin): Result<Plugin> = runCatching {
-        val fileName = targetPlugin.javaClass.protectionDomain.codeSource.location.file
-        val file = File(fileName)
-        val jarName = file.name
+        val sourceFile = jarFileOf(targetPlugin)
         unloadPlugin(targetPlugin).getOrThrow()
-        loadPlugin(jarName).getOrThrow()
+        loadSingleJar(sourceFile).getOrThrow()
+    }
+
+    fun reloadByFile(jarFile: File): Result<Plugin> = runCatching {
+        val descriptor = ymlParser.parseJar(jarFile)
+            ?: throw IllegalArgumentException("${jarFile.name} has no readable plugin.yml")
+
+        val existing = Bukkit.getPluginManager().getPlugin(descriptor.name)
+        if (existing != null) {
+            unloadPlugin(existing).getOrThrow()
+        }
+        loadSingleJar(jarFile).getOrThrow()
+    }
+
+    fun buildFullGraph(): DependencyGraph = DependencyGraph(ymlParser.scanDirectory(pluginsDirectory))
+
+    fun jarFileOf(targetPlugin: Plugin): File {
+        val location = targetPlugin.javaClass.protectionDomain.codeSource.location.file
+        return File(location)
+    }
+
+    private fun loadWithDependencies(pluginFile: File): Result<Plugin> = runCatching {
+        val graph = buildFullGraph()
+        val target = ymlParser.parseJar(pluginFile)
+            ?: throw IllegalArgumentException("${pluginFile.name} has no readable plugin.yml")
+
+        val resolved = graph.descriptorOf(target.name) ?: target
+        val effectiveGraph = if (graph.descriptorOf(target.name) != null) graph else DependencyGraph(graph.all() + target)
+
+        when (val result = effectiveGraph.resolveFor(resolved)) {
+            is DagResult.MissingDependency -> throw IllegalStateException(
+                "Cannot load ${result.plugin}: missing required dependency '${result.missing}'. " +
+                        "Drop its jar into the plugins folder and try again."
+            )
+            is DagResult.CycleDetected -> throw IllegalStateException(
+                "Circular dependency detected between: ${result.cycle.joinToString(" -> ")}"
+            )
+            is DagResult.Success -> {
+                var loadedTarget: Plugin? = null
+                for (descriptor in result.order) {
+                    val alreadyLoaded = Bukkit.getPluginManager().getPlugin(descriptor.name)
+                    val loaded = if (alreadyLoaded != null && alreadyLoaded.isEnabled) {
+                        alreadyLoaded
+                    } else {
+                        loadSingleJar(descriptor.file).getOrThrow()
+                    }
+                    if (descriptor.key == resolved.key) loadedTarget = loaded
+                }
+                loadedTarget ?: throw IllegalStateException("Resolved load order never produced the target plugin")
+            }
+        }
+    }
+
+    private fun loadSingleJar(pluginFile: File): Result<Plugin> = runCatching {
+        // Determine if we need to spoof the version
+        val effectiveFile = if (shouldSpoofVersion(pluginFile)) {
+            plugin.logger.info("Plugin was previously unloaded this session and version-spoofing-on-reload is enabled. Creating version-spoofed copy of ${pluginFile.name}...")
+            versionSpoofer.spoofVersion(pluginFile, scratchDirectory) ?: pluginFile.also {
+                plugin.logger.warning("Version spoofing failed for ${pluginFile.name}, loading original jar")
+            }
+        } else {
+            pluginFile
+        }
+
+        val targetPlugin = pluginManager.loadPlugin(effectiveFile)
+            ?: throw IllegalStateException("Error with plugin structure")
+
+        targetPlugin.onLoad()
+        pluginManager.enablePlugin(targetPlugin)
+        Bukkit.getOnlinePlayers().forEach { it.updateCommands() }
+        targetPlugin
+    }
+    
+    /**
+     * Returns true if this jar should have its version spoofed before loading.
+     * Requires: version-spoofing-on-reload enabled, AND the plugin's name
+     * appears in our unloadedInSession set (meaning we unloaded it earlier).
+     */
+    private fun shouldSpoofVersion(pluginFile: File): Boolean {
+        if (!config.versionSpoofingOnReload) return false
+        
+        val descriptor = ymlParser.parseJar(pluginFile) ?: return false
+        return unloadedInSession.contains(descriptor.name)
+    }
+    
+    /**
+     * Cleans up temporary version-spoofed jars. Should be called on plugin disable.
+     */
+    fun cleanup() {
+        versionSpoofer.cleanupScratchDirectory(scratchDirectory)
     }
 }

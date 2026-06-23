@@ -1,0 +1,43 @@
+hot-reload:
+  # Master switch for the filesystem watcher.
+  enabled: true
+  # Milliseconds to wait after the last detected change to a jar before
+  # actually reloading it. Protects against partial writes (e.g. an IDE or
+  # FTP client still copying the file) and against duplicate OS events for
+  # a single save. Increase this on slow disks / network mounts.
+  debounce-millis: 1500
+  # If true, a new/changed jar that ISN'T currently loaded will be
+  # auto-loaded too (not just reloads of already-loaded plugins).
+  auto-load-new-jars: true
+  # Plugin names (case-insensitive) that hot-reload will never touch,
+  # even if their jar changes on disk. BetterPlugman protects itself
+  # automatically regardless of this list.
+  ignore:
+    - example
+
+cleanup:
+  # Aggressive cleanup tries much harder to fully unload a plugin's
+  # classes and free memory: cancels scheduler tasks, unregisters
+  # listeners/commands, nulls static fields declared by the plugin's own
+  # classes, and force-closes the URLClassLoader. Turn this off only if
+  # it causes instability with a specific plugin.
+  aggressive: true
+  # Null out static fields on the plugin's own classes after disable.
+  # This is what actually lets the old ClassLoader (and everything it
+  # loaded) become garbage - without it, a single static reference can
+  # keep the whole old plugin version pinned in memory forever.
+  null-static-fields: true
+  # Call System.gc() after unload to encourage immediate collection of
+  # the now-unreferenced classloader. Cosmetic for memory graphs, has no
+  # effect on correctness.
+  suggest-gc: true
+  # KNOWN PAPER/LEAF LIMITATION WORKAROUND.
+  # Paper's ModernPluginLoadingStrategy permanently remembers every
+  # "name + version" it has ever loaded in this server session, with no
+  version-spoofing-on-reload: false
+
+dag:
+  # If true, /pm load will automatically pull in and load any missing
+  # soft/hard dependencies it can find sitting in the plugins folder
+  # before loading the requested plugin.
+  auto-resolve-dependencies: true

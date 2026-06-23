@@ -2,5 +2,16 @@ name: BetterPlugman
 version: '${version}'
 
 main: net.ilypluggy.betterplugman.Main
-api-version: '1.21.4'
+api-version: '1.21'
 load: POSTWORLD
+
+commands:
+  pm:
+    description: Manage plugins with dependency-aware load/unload/reload and a live dependency graph.
+    usage: /pm <load|unload|reload|list|graph|config> [target]
+    permission: betterplugman.admin
+
+permissions:
+  betterplugman.admin:
+    description: Allows full control over BetterPlugman (load/unload/reload/graph/config).
+    default: op
